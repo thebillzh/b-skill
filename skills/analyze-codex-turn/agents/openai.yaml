@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Codex Turn"
+  short_description: "AI analysis of Codex turn time and stalls"
+  default_prompt: "Use $analyze-codex-turn to parse a Codex thread JSONL, then synthesize a granular AI analysis of time spent, stuck points, and improvements."
