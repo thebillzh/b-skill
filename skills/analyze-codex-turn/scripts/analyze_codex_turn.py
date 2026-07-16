@@ -30,6 +30,25 @@ ISO_Z_RE = re.compile(r"Z$")
 WALL_RE = re.compile(r"Wall time:\s*([0-9]+(?:\.[0-9]+)?)\s*seconds", re.I)
 EXIT_RE = re.compile(r"(?:Process exited with code|Exit code:)\s*(-?\d+)", re.I)
 ORIG_TOK_RE = re.compile(r"Original token count:\s*([0-9]+)", re.I)
+NESTED_EXIT_RE = re.compile(r'["\']exit_code["\']\s*:\s*(-?\d+)', re.I)
+NESTED_WALL_RE = re.compile(r'["\']wall_time_seconds["\']\s*:\s*([0-9]+(?:\.[0-9]+)?)', re.I)
+NESTED_ORIG_TOK_RE = re.compile(r'["\']original_token_count["\']\s*:\s*([0-9]+)', re.I)
+SESSION_ID_RE = re.compile(r'(?:["\']session_id["\']|\bsession_id)\s*[:=]\s*(\d+)', re.I)
+YIELDED_CELL_RE = re.compile(r"Script running with cell ID\s+(\S+)", re.I)
+APPROVAL_REJECTION_RE = re.compile(
+    r"This action was rejected due to|approval (?:request )?(?:was )?rejected|"
+    r"request was rejected|Rejected\([\\\"']This action was rejected",
+    re.I,
+)
+UNSUPPORTED_TOOL_RE = re.compile(
+    r"This (?:method|operation|tool|command|capability) is not supported",
+    re.I,
+)
+TOOL_WRAPPER_FAILURE_RE = re.compile(r"(?:^|\n)Script (?:failed|error):?", re.I)
+BROWSER_SESSION_FAILURE_RE = re.compile(
+    r"(?:Tab|Page)\s+\S+\s+is not part of browser session|browser session\s+\S+\s+is no longer available",
+    re.I,
+)
 
 STALL_WORDS = re.compile(
     r"\b(blocked|quota|failed|failure|error|retry|relaunch|stale|still running|aborted|timeout|timed out|not stale|empty output)\b",
@@ -95,7 +114,7 @@ def classify_tool(name: str, command: str, input_text: str = "") -> str:
     stripped = command.strip().lower()
     if name == "apply_patch":
         return "edit_patch"
-    if name == "write_stdin":
+    if name == "write_stdin" or "tools.write_stdin" in hay:
         return "session_wait"
     if re.search(r"\b(cargo (test|nextest|check|clippy)|npm (test|run|exec)|pnpm |pytest|tsc|typecheck|lint|format)\b", hay):
         return "verification"
@@ -112,24 +131,122 @@ def classify_tool(name: str, command: str, input_text: str = "") -> str:
     return name or "tool_other"
 
 
+def output_text(output: Any) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if isinstance(output, list):
+        return "\n".join(part for item in output if (part := output_text(item)))
+    if isinstance(output, dict):
+        if isinstance(output.get("text"), str):
+            return output["text"]
+        return json.dumps(output, ensure_ascii=False)
+    return str(output)
+
+
+def json_values_from_text(text: str) -> list[Any]:
+    values: list[Any] = []
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\[{]", text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start() :])
+        except json.JSONDecodeError:
+            continue
+        values.append(value)
+    return values
+
+
+def nested_tool_record(output: Any, text: str) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            candidates.append(value)
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    collect(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    collect(output)
+    for value in json_values_from_text(text):
+        collect(value)
+    tool_keys = {"chunk_id", "exit_code", "original_token_count", "session_id", "wall_time_seconds"}
+    matching = [candidate for candidate in candidates if tool_keys.intersection(candidate)]
+    return matching[-1] if matching else None
+
+
 def output_stats(output: Any, max_chars: int) -> dict[str, Any]:
-    text = "" if output is None else str(output)
+    text = output_text(output)
+    nested = nested_tool_record(output, text) or {}
     wall = None
-    m = WALL_RE.search(text)
-    if m:
-        wall = float(m.group(1))
+    if isinstance(nested.get("wall_time_seconds"), (int, float)):
+        wall = float(nested["wall_time_seconds"])
+    else:
+        m = NESTED_WALL_RE.search(text)
+        if m:
+            wall = float(m.group(1))
+        else:
+            m = WALL_RE.search(text)
+            if m:
+                wall = float(m.group(1))
     exit_code = None
     m = EXIT_RE.search(text)
     if m:
         exit_code = int(m.group(1))
+    elif isinstance(nested.get("exit_code"), int):
+        exit_code = nested["exit_code"]
+    else:
+        m = NESTED_EXIT_RE.search(text)
+        if m:
+            exit_code = int(m.group(1))
     original_tokens = None
-    m = ORIG_TOK_RE.search(text)
-    if m:
-        original_tokens = int(m.group(1))
+    if isinstance(nested.get("original_token_count"), int):
+        original_tokens = nested["original_token_count"]
+    else:
+        m = NESTED_ORIG_TOK_RE.search(text)
+        if m:
+            original_tokens = int(m.group(1))
+        else:
+            m = ORIG_TOK_RE.search(text)
+            if m:
+                original_tokens = int(m.group(1))
+    session_id = nested.get("session_id")
+    if session_id is None:
+        m = SESSION_ID_RE.search(text)
+        if m:
+            session_id = int(m.group(1))
+    yielded_match = YIELDED_CELL_RE.search(text)
+    failure_kind = None
+    if exit_code not in (None, 0):
+        failure_kind = "nonzero_exit"
+    elif APPROVAL_REJECTION_RE.search(text):
+        failure_kind = "approval_rejected"
+    elif UNSUPPORTED_TOOL_RE.search(text):
+        failure_kind = "unsupported_tool_response"
+    elif BROWSER_SESSION_FAILURE_RE.search(text):
+        failure_kind = "browser_session_lost"
+    elif TOOL_WRAPPER_FAILURE_RE.search(text):
+        failure_kind = "tool_wrapper_failed"
+    if yielded_match:
+        completion_state = "yielded_cell"
+    elif session_id is not None and exit_code is None:
+        completion_state = "running_session"
+    elif failure_kind:
+        completion_state = "failed"
+    else:
+        completion_state = "completed"
     return {
         "exit_code": exit_code,
         "reported_wall_seconds": wall,
         "original_token_count": original_tokens,
+        "session_id": session_id,
+        "yielded_cell_id": yielded_match.group(1) if yielded_match else None,
+        "completion_state": completion_state,
+        "failed": failure_kind is not None,
+        "failure_kind": failure_kind,
         "truncated_by_codex": "Warning: truncated output" in text or "truncated" in text.lower(),
         "preview": text[:max_chars],
         "tail_preview": text[-max_chars:] if len(text) > max_chars else "",
@@ -215,6 +332,15 @@ def message_text_from_event(ev: dict[str, Any]) -> str:
 
 def is_environment_message(text: str) -> bool:
     return "<environment_context>" in text
+
+
+def is_compaction_event(ev: dict[str, Any], has_raw_compactions: bool) -> bool:
+    payload = ev.get("payload") or {}
+    return ev.get("type") == "compacted" or (
+        not has_raw_compactions
+        and ev.get("type") == "event_msg"
+        and payload.get("type") == "context_compacted"
+    )
 
 
 def is_synthetic_turn_start(ev: dict[str, Any]) -> bool:
@@ -360,6 +486,7 @@ def analyze_turn(
     compactions: list[dict[str, Any]] = []
     token_records: list[dict[str, Any]] = []
     user_messages: list[str] = []
+    has_raw_compactions = any(ev.get("type") == "compacted" for ev in interval)
 
     for ev in interval:
         payload = ev.get("payload") or {}
@@ -384,7 +511,7 @@ def analyze_turn(
         elif ev_type == "response_item" and ptype == "reasoning":
             text = text_from_reasoning_payload(payload)
             reasoning.append({"ts": ts.isoformat(), "local_time": fmt_dt(ts, tz), "title": reasoning_title(text), "text": text, "source": "response_item"})
-        elif ev_type in {"compacted", "inter_agent_communication"} or (ev_type == "event_msg" and ptype == "context_compacted"):
+        elif is_compaction_event(ev, has_raw_compactions):
             compactions.append({"ts": ts.isoformat(), "local_time": fmt_dt(ts, tz), "type": ev_type, "payload_type": ptype})
         elif ev_type == "event_msg" and ptype == "token_count":
             info = payload.get("info") or {}
@@ -454,6 +581,8 @@ def analyze_turn(
                 call["elapsed_ms"] = (ts - parse_ts(call["start_ts"])).total_seconds() * 1000
             call["output"] = output_stats(payload.get("output"), max_output_chars)
 
+    link_yielded_cells(ordered_calls)
+
     # Timeline segment allocation.
     active: dict[str, dict[str, Any]] = {}
     last_mode = "startup"
@@ -498,7 +627,7 @@ def analyze_turn(
             last_mode = "model_reasoning"
         elif ev_type == "event_msg" and ptype == "agent_message":
             last_mode = "agent_message"
-        elif ev_type in {"compacted"} or (ev_type == "event_msg" and ptype == "context_compacted"):
+        elif is_compaction_event(ev, has_raw_compactions):
             last_mode = "context_compaction"
         elif ev_type == "event_msg" and ptype == "token_count":
             # Token telemetry often lands between true activity markers; keep current mode.
@@ -506,13 +635,27 @@ def analyze_turn(
         prev_ts = ts
 
     long_calls = [c for c in ordered_calls if (c.get("elapsed_ms") or 0) >= long_call_ms]
-    failed_calls = [c for c in ordered_calls if (c.get("output") or {}).get("exit_code") not in (None, 0)]
+    failed_calls = [c for c in ordered_calls if (c.get("output") or {}).get("failed")]
     truncated_calls = [c for c in ordered_calls if (c.get("output") or {}).get("truncated_by_codex")]
     long_gaps = [s for s in segments if s["elapsed_ms"] >= long_gap_ms]
     stall_messages = [m for m in agent_messages if STALL_WORDS.search(m["message"])]
     stall_reasoning = [r for r in reasoning if STALL_WORDS.search(r["title"] + "\n" + r["text"])]
 
     category_counts = Counter(c["category"] for c in ordered_calls)
+    process_clusters = build_process_clusters(ordered_calls)
+    clustered_ordinals = {
+        ordinal for cluster in process_clusters for ordinal in cluster["call_ordinals"]
+    }
+    incomplete_calls = [
+        c
+        for c in ordered_calls
+        if (c.get("output") or {}).get("completion_state") == "yielded_cell"
+        or (
+            (c.get("output") or {}).get("completion_state") == "running_session"
+            and c.get("ordinal") not in clustered_ordinals
+        )
+    ]
+    collapsed_calls = sum(max(0, len(cluster["call_ordinals"]) - 1) for cluster in process_clusters)
     category_call_ms: Counter[str] = Counter()
     for c in ordered_calls:
         category_call_ms[c["category"]] += c.get("elapsed_ms") or 0
@@ -562,6 +705,10 @@ def analyze_turn(
         "counts": {
             "events": len(interval),
             "tool_calls": len(ordered_calls),
+            "logical_tool_operations": len(ordered_calls) - collapsed_calls,
+            "process_clusters": len(process_clusters),
+            "polling_calls": sum(cluster["poll_count"] for cluster in process_clusters),
+            "poll_wait_calls": sum(cluster["wait_call_count"] for cluster in process_clusters),
             "agent_messages": len(agent_messages),
             "reasoning_items": len(reasoning),
             "compactions": len(compactions),
@@ -577,8 +724,10 @@ def analyze_turn(
         },
         "tool_summary": {
             "category_counts": dict(category_counts),
+            "process_clusters": process_clusters,
             "long_calls": [summarize_call(c) for c in long_calls],
             "failed_calls": [summarize_call(c) for c in failed_calls],
+            "incomplete_calls": [summarize_call(c) for c in incomplete_calls],
             "truncated_calls": [summarize_call(c) for c in truncated_calls],
         },
         "stuck_signals": {
@@ -611,9 +760,94 @@ def summarize_call(call: dict[str, Any]) -> dict[str, Any]:
         "elapsed_human": fmt_ms(call.get("elapsed_ms") or 0),
         "reported_wall_seconds": out.get("reported_wall_seconds"),
         "exit_code": out.get("exit_code"),
+        "completion_state": out.get("completion_state"),
+        "resolved_by_ordinal": out.get("resolved_by_ordinal"),
+        "failure_kind": out.get("failure_kind"),
         "command": short(call.get("command") or call.get("input_preview"), 240),
         "output_preview": short(out.get("preview"), 240),
     }
+
+
+def link_yielded_cells(calls: list[dict[str, Any]]) -> None:
+    yielded_by_id = {
+        str(output["yielded_cell_id"]): call
+        for call in calls
+        if (output := call.get("output") or {}).get("yielded_cell_id") is not None
+    }
+    for call in calls:
+        if call.get("name") != "wait" or not isinstance(call.get("arguments"), dict):
+            continue
+        cell_id = call["arguments"].get("cell_id")
+        yielded = yielded_by_id.get(str(cell_id))
+        wait_state = (call.get("output") or {}).get("completion_state")
+        if yielded is None or wait_state == "yielded_cell":
+            continue
+        yielded_output = yielded.get("output") or {}
+        yielded_output["resolved_by_ordinal"] = call.get("ordinal")
+        yielded_output["completion_state"] = f"yielded_then_{wait_state or 'completed'}"
+
+
+def session_id_from_call(call: dict[str, Any]) -> str | None:
+    command = call.get("command") or ""
+    match = SESSION_ID_RE.search(command)
+    if match:
+        return match.group(1)
+    session_id = (call.get("output") or {}).get("session_id")
+    return str(session_id) if session_id is not None else None
+
+
+def is_poll_call(call: dict[str, Any]) -> bool:
+    return call.get("name") in {"wait", "write_stdin"} or "tools.write_stdin" in (call.get("command") or "")
+
+
+def build_process_clusters(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    clusters: dict[str, dict[str, Any]] = {}
+    roots: dict[str, dict[str, Any]] = {}
+    for call in calls:
+        session_id = session_id_from_call(call)
+        if session_id and not is_poll_call(call) and (call.get("output") or {}).get("session_id") is not None:
+            roots.setdefault(session_id, call)
+    for call in calls:
+        if not is_poll_call(call):
+            continue
+        session_id = session_id_from_call(call)
+        if not session_id:
+            continue
+        cluster = clusters.setdefault(session_id, {"root": roots.get(session_id), "polls": []})
+        cluster["polls"].append(call)
+
+    result: list[dict[str, Any]] = []
+    for session_id, cluster in clusters.items():
+        members = ([cluster["root"]] if cluster["root"] else []) + cluster["polls"]
+        members = sorted(members, key=lambda call: call.get("ordinal") or 0)
+        final_output = members[-1].get("output") or {}
+        start_ts = next((call.get("start_ts") for call in members if call.get("start_ts")), None)
+        end_ts = next((call.get("end_ts") for call in reversed(members) if call.get("end_ts")), None)
+        elapsed_ms = None
+        if start_ts and end_ts:
+            elapsed_ms = (parse_ts(end_ts) - parse_ts(start_ts)).total_seconds() * 1000
+        result.append(
+            {
+                "session_id": session_id,
+                "root_ordinal": cluster["root"].get("ordinal") if cluster["root"] else None,
+                "poll_count": sum(
+                    1
+                    for call in cluster["polls"]
+                    if call.get("name") == "write_stdin" or "tools.write_stdin" in (call.get("command") or "")
+                ),
+                "wait_call_count": sum(1 for call in cluster["polls"] if call.get("name") == "wait"),
+                "continuation_call_count": len(cluster["polls"]),
+                "call_ordinals": [call.get("ordinal") for call in members],
+                "start_local": members[0].get("start_local"),
+                "elapsed_ms": elapsed_ms,
+                "elapsed_human": fmt_ms(elapsed_ms or 0),
+                "completion_state": final_output.get("completion_state"),
+                "exit_code": final_output.get("exit_code"),
+                "failure_kind": final_output.get("failure_kind"),
+                "command": short((cluster["root"] or members[0]).get("command"), 240),
+            }
+        )
+    return sorted(result, key=lambda cluster: cluster["call_ordinals"][0])
 
 
 def render_markdown(analysis: dict[str, Any], tz: str) -> str:
@@ -634,14 +868,19 @@ def render_markdown(analysis: dict[str, Any], tz: str) -> str:
     lines.append("## 1. Headline counts")
     lines.append("")
     lines.append(f"1. Events in interval: {counts['events']}")
-    lines.append(f"2. Tool calls: {counts['tool_calls']}")
-    lines.append(f"3. Agent messages: {counts['agent_messages']}")
-    lines.append(f"4. Reasoning items: {counts['reasoning_items']}")
-    lines.append(f"5. Context compactions: {counts['compactions']}")
+    lines.append(f"2. Raw tool calls: {counts['tool_calls']}")
+    lines.append(f"3. Logical tool operations after polling collapse: {counts['logical_tool_operations']}")
+    lines.append(
+        f"4. Long-running process clusters: {counts['process_clusters']} "
+        f"({counts['polling_calls']} polling calls, {counts['poll_wait_calls']} yielded-cell continuations)"
+    )
+    lines.append(f"5. Agent messages: {counts['agent_messages']}")
+    lines.append(f"6. Reasoning items: {counts['reasoning_items']}")
+    lines.append(f"7. Context compactions: {counts['compactions']}")
     usage = analysis.get("token_usage_last_record") or {}
     if usage:
         lines.append(
-            "6. Last recorded cumulative tokens: "
+            "8. Last recorded cumulative tokens: "
             + ", ".join(f"{k}={v}" for k, v in usage.items() if isinstance(v, int))
         )
     lines.append("")
@@ -666,39 +905,59 @@ def render_markdown(analysis: dict[str, Any], tz: str) -> str:
         lines.append(f"{i}. `{cat}`: {count} calls, {elapsed} summed call elapsed")
     lines.append("")
 
-    lines.append("## 4. Long calls")
+    lines.append("## 4. Long-running process clusters")
+    lines.append("")
+    if tool_summary["process_clusters"]:
+        lines.append("| Session | Root | Polls | Cell waits | Calls | Wall span | State | Exit | Command |")
+        lines.append("|---|---:|---:|---:|---|---:|---|---:|---|")
+        for cluster in tool_summary["process_clusters"]:
+            ordinals = ", ".join(str(value) for value in cluster["call_ordinals"])
+            lines.append(
+                f"| `{cluster['session_id']}` | {cluster['root_ordinal']} | {cluster['poll_count']} | {cluster['wait_call_count']} | {ordinals} | {cluster['elapsed_human']} | `{cluster['completion_state']}` | {cluster['exit_code']} | {md_escape(cluster['command'])} |"
+            )
+    else:
+        lines.append("No polling calls were associated with a long-running process session.")
+    lines.append("")
+
+    lines.append("## 5. Long calls")
     lines.append("")
     if tool_summary["long_calls"]:
-        lines.append("| # | Local start | Duration | Category | Tool | Exit | Command |")
-        lines.append("|---:|---|---:|---|---|---:|---|")
+        lines.append("| # | Local start | Duration | Category | Tool | State | Exit | Command |")
+        lines.append("|---:|---|---:|---|---|---|---:|---|")
         for c in tool_summary["long_calls"][:80]:
             lines.append(
-                f"| {c['ordinal']} | {c['start_local']} | {c['elapsed_human']} | `{c['category']}` | `{c['name']}` | {c['exit_code']} | {md_escape(c['command'])} |"
+                f"| {c['ordinal']} | {c['start_local']} | {c['elapsed_human']} | `{c['category']}` | `{c['name']}` | `{c['completion_state']}` | {c['exit_code']} | {md_escape(c['command'])} |"
             )
     else:
         lines.append("No long calls crossed the threshold.")
     lines.append("")
 
-    lines.append("## 5. Failure and stuck signals")
+    lines.append("## 6. Failure and stuck signals")
     lines.append("")
     failed = tool_summary["failed_calls"]
-    lines.append(f"1. Failed/non-zero tool calls: {len(failed)}")
+    lines.append(f"1. Failed tool calls: {len(failed)}")
     for c in failed[:30]:
-        lines.append(f"   - #{c['ordinal']} {c['elapsed_human']} `{c['category']}` exit={c['exit_code']}: {c['command']}")
-    lines.append(f"2. Long gaps: {analysis['stuck_signals']['long_gap_count']}")
+        lines.append(
+            f"   - #{c['ordinal']} {c['elapsed_human']} `{c['category']}` failure={c['failure_kind']} exit={c['exit_code']}: {c['command']}"
+        )
+    incomplete = tool_summary["incomplete_calls"]
+    lines.append(f"2. Incomplete/yielded tool calls: {len(incomplete)}")
+    for c in incomplete[:30]:
+        lines.append(f"   - #{c['ordinal']} {c['elapsed_human']} state={c['completion_state']}: {c['command']}")
+    lines.append(f"3. Long gaps: {analysis['stuck_signals']['long_gap_count']}")
     for gap in analysis["stuck_signals"]["long_gaps"][:20]:
         lines.append(
             f"   - {fmt_dt(parse_ts(gap['start_ts']), tz)} → {fmt_dt(parse_ts(gap['end_ts']), tz)}: {fmt_ms(gap['elapsed_ms'])} as `{gap['label']}`"
         )
-    lines.append(f"3. Stall-keyword agent messages: {len(analysis['stuck_signals']['stall_agent_messages'])}")
+    lines.append(f"4. Stall-keyword agent messages: {len(analysis['stuck_signals']['stall_agent_messages'])}")
     for m in analysis["stuck_signals"]["stall_agent_messages"][:30]:
         lines.append(f"   - {m['local_time']}: {short(m['message'], 300)}")
-    lines.append(f"4. Stall-keyword reasoning items: {len(analysis['stuck_signals']['stall_reasoning'])}")
+    lines.append(f"5. Stall-keyword reasoning items: {len(analysis['stuck_signals']['stall_reasoning'])}")
     for r in analysis["stuck_signals"]["stall_reasoning"][:20]:
         lines.append(f"   - {r['local_time']}: {r['title']} — {r['text_preview']}")
     lines.append("")
 
-    lines.append("## 6. Five-minute bins")
+    lines.append("## 7. Five-minute bins")
     lines.append("")
     lines.append("| Window | Tool calls | Categories | Agent msgs | Stall msgs | Sample visible messages |")
     lines.append("|---|---:|---|---:|---:|---|")
@@ -708,20 +967,20 @@ def render_markdown(analysis: dict[str, Any], tz: str) -> str:
         lines.append(f"| {b['start_local']} → {b['end_local']} | {b['tool_call_count']} | {md_escape(cats)} | {b['agent_message_count']} | {b['stall_message_count']} | {samples} |")
     lines.append("")
 
-    lines.append("## 7. All tool calls")
+    lines.append("## 8. All tool calls")
     lines.append("")
-    lines.append("| # | Local start | Elapsed | Category | Tool | Exit | Command/input summary |")
-    lines.append("|---:|---|---:|---|---|---:|---|")
+    lines.append("| # | Local start | Elapsed | Category | Tool | State | Exit | Command/input summary |")
+    lines.append("|---:|---|---:|---|---|---|---:|---|")
     for c in analysis["tool_calls"]:
         out = c.get("output") or {}
         cmd = c.get("command") or c.get("input_preview") or ""
         elapsed = fmt_ms(c.get("elapsed_ms") or 0)
         lines.append(
-            f"| {c['ordinal']} | {c.get('start_local') or ''} | {elapsed} | `{c.get('category')}` | `{c.get('name')}` | {out.get('exit_code')} | {md_escape(short(cmd, 220))} |"
+            f"| {c['ordinal']} | {c.get('start_local') or ''} | {elapsed} | `{c.get('category')}` | `{c.get('name')}` | `{out.get('completion_state')}` | {out.get('exit_code')} | {md_escape(short(cmd, 220))} |"
         )
     lines.append("")
 
-    lines.append("## 8. Analyst prompt handoff")
+    lines.append("## 9. Analyst prompt handoff")
     lines.append("")
     lines.append("Use `references/deep-analysis-prompt.md` with this Markdown file plus the sibling JSON artifact. The JSON contains output previews, full call ordering, token records, and stall signals.")
     lines.append("")

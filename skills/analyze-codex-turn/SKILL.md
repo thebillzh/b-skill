@@ -60,5 +60,6 @@ Do not present the script output as the answer. Use it as evidence for a synthes
 - `scripts/analyze_codex_turn.py` is stdlib-only.
 - It recognizes Codex `task_started` / `task_complete`, `response_item` tool calls and outputs, `agent_message`, `agent_reasoning`, `context_compacted`, and `token_count` records.
 - It includes every detected tool call in the Markdown table and structured JSON. Output bodies are previewed by default; raise `--max-output-chars` if deeper inspection is needed.
+- It parses nested unified-exec results for exit codes and process sessions, flags approval rejections and unsupported-tool responses, distinguishes yielded cells from completed calls, counts canonical raw compactions once, and groups repeated process polling into logical clusters while retaining the raw call table.
 - It treats `token_count` as telemetry. Time allocation is based on event gaps and active tool-call windows, so use it as a strong heuristic, then verify surprising conclusions against raw JSONL.
 - `--timezone` defaults to the `$TZ` environment variable, falling back to UTC; pass an explicit IANA zone to localize timestamps for a specific reviewer.
